@@ -3,6 +3,7 @@ package event
 import (
 	"fmt"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -17,6 +18,7 @@ type SubscriptionInfo struct {
 }
 
 type Store struct {
+	mu            sync.RWMutex
 	events         []*Event
 	topicIndex     map[string][]string
 	subscriptions  map[string]*SubscriptionInfo
@@ -35,12 +37,14 @@ func NewStore() *Store {
 func (s *Store) Publish(topic string, payload interface{}, retention int) (string, error) {
 	event := NewEvent(topic, payload, retention)
 
+	s.mu.Lock()
 	s.events = append(s.events, event)
 
 	if s.topicIndex[topic] == nil {
 		s.topicIndex[topic] = make([]string, 0)
 	}
 	s.topicIndex[topic] = append(s.topicIndex[topic], event.ID)
+	s.mu.Unlock()
 
 	atomic.AddInt64(&s.eventCounter, 1)
 
@@ -48,8 +52,10 @@ func (s *Store) Publish(topic string, payload interface{}, retention int) (strin
 }
 
 func (s *Store) Pull(subscriptionID string, limit int) ([]Event, bool, error) {
+	s.mu.RLock()
 	sub, exists := s.subscriptions[subscriptionID]
 	if !exists {
+		s.mu.RUnlock()
 		return nil, false, fmt.Errorf("subscription not found: %s", subscriptionID)
 	}
 
@@ -79,11 +85,14 @@ func (s *Store) Pull(subscriptionID string, limit int) ([]Event, bool, error) {
 	if limit > 0 && len(result) > limit {
 		hasMore = true
 	}
+	s.mu.RUnlock()
 
 	return result, hasMore, nil
 }
 
 func (s *Store) GetEvent(id string) (*Event, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, e := range s.events {
 		if e.ID == id {
 			return e, nil
@@ -109,9 +118,10 @@ func (s *Store) CreateSubscription(subscriberID, topicPattern string, historyLim
 		LastPullAt:   time.Now(),
 	}
 
+	s.mu.Lock()
 	s.subscriptions[subID] = sub
-
 	matchedTopics := s.findMatchingTopics(topicPattern)
+	s.mu.Unlock()
 
 	return subID, matchedTopics, nil
 }
@@ -170,6 +180,9 @@ func (s *Store) findEventByID(id string) *Event {
 }
 
 func (s *Store) CleanupExpired() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	expiredCount := 0
 	now := time.Now()
 
@@ -207,14 +220,20 @@ func (s *Store) CleanupExpired() int {
 }
 
 func (s *Store) TotalEvents() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.events)
 }
 
 func (s *Store) TotalSubscriptions() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return len(s.subscriptions)
 }
 
 func (s *Store) TopicCounts() map[string]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	counts := make(map[string]int)
 	for _, e := range s.events {
 		counts[e.Topic]++
@@ -223,18 +242,37 @@ func (s *Store) TopicCounts() map[string]int {
 }
 
 func (s *Store) Events() []*Event {
-	return s.events
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*Event, len(s.events))
+	copy(result, s.events)
+	return result
 }
 
 func (s *Store) Subscriptions() map[string]*SubscriptionInfo {
-	return s.subscriptions
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make(map[string]*SubscriptionInfo)
+	for k, v := range s.subscriptions {
+		result[k] = v
+	}
+	return result
 }
 
 func (s *Store) TopicIndex() map[string][]string {
-	return s.topicIndex
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make(map[string][]string)
+	for k, v := range s.topicIndex {
+		cp := make([]string, len(v))
+		copy(cp, v)
+		result[k] = cp
+	}
+	return result
 }
 
 func (s *Store) LoadFromSnapshot(events []*Event) {
+	s.mu.Lock()
 	for _, e := range events {
 		s.events = append(s.events, e)
 		if s.topicIndex[e.Topic] == nil {
@@ -242,6 +280,7 @@ func (s *Store) LoadFromSnapshot(events []*Event) {
 		}
 		s.topicIndex[e.Topic] = append(s.topicIndex[e.Topic], e.ID)
 	}
+	s.mu.Unlock()
 	atomic.StoreInt64(&s.eventCounter, int64(len(events)))
 	log.Printf("[Store] Loaded %d events from snapshot", len(events))
 }
