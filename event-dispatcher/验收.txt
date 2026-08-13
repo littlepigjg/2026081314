@@ -1,0 +1,155 @@
+## 缺陷验收
+
+### event-conc-001
+
+#### 复现步骤
+
+准备一台已安装 Go 1.21+ 的 Linux 或 macOS 机器，将项目仓库克隆到本地并切换到初始提交。设置 GOTOOLCHAIN=local 环境变量以确保使用本地 Go 工具链。在项目根目录执行 go run -race ./cmd/server/main.go 启动服务，等待 2 秒让服务就绪和后台清理协程完成初始化。然后通过 POST /subscribe 接口创建一个订阅，主题模式为 order.*，服务将返回 subscription_id 为 sub-001。接着启动 20 个后台协程，每个协程以 0.1 秒间隔循环向 POST /event 发布 order.created 或 order.updated 事件；同时启动 10 个后台协程，每个以 0.2 秒间隔循环向 POST /pull 拉取 sub-001 的事件。持续运行 5 秒后，服务会因 concurrent map read and map write 或切片越界而 panic 崩溃。
+
+#### verify_cmds
+
+```bash
+#!/bin/bash
+set -e
+
+# 环境准备（替换为实际仓库路径）
+REPO_URL="file:///path/to/event-dispatcher"
+BASE_COMMIT="aba42855b3d5edee1a7b67538b2645ba04274acd"
+git clone "$REPO_URL" event-dispatcher
+cd event-dispatcher
+git checkout "$BASE_COMMIT"
+export GOTOOLCHAIN=local
+
+# 启动服务（使用 -race 增强检测）
+go run -race ./cmd/server/main.go &
+SERVER_PID=$!
+sleep 2  # 等待服务就绪
+
+# 前置准备：创建一个订阅
+curl -X POST http://localhost:8080/subscribe \
+     -d '{"subscriber_id":"test-sub","topic_pattern":"order.*"}' \
+     -H "Content-Type: application/json" > /dev/null
+
+# 触发缺陷：并发发布和拉取
+# 启动 20 个发布协程（发布 order.created 和 order.updated）
+for i in {1..20}; do
+    (
+        while true; do
+            topic="order.$((RANDOM % 2 == 0 ? 'created' : 'updated'))"
+            curl -s -X POST http://localhost:8080/event \
+                 -d "{\"topic\":\"$topic\",\"payload\":{\"id\":$RANDOM}}" \
+                 -H "Content-Type: application/json" > /dev/null
+            sleep 0.1
+        done
+    ) &
+done
+
+# 启动 10 个拉取协程
+for i in {1..10}; do
+    (
+        while true; do
+            curl -s -X POST http://localhost:8080/pull \
+                 -d '{"subscription_id":"sub-001","limit":5}' \
+                 -H "Content-Type: application/json" > /dev/null
+            sleep 0.2
+        done
+    ) &
+done
+
+# 持续运行 5 秒，触发 panic
+sleep 5
+
+# 验证：检查进程是否存活
+if kill -0 $SERVER_PID 2>/dev/null; then
+    echo "GREEN: 服务进程存活，未发生 panic（修复后预期）"
+else
+    echo "RED: 服务进程已崩溃，触发并发 map/slice panic（未修复预期）"
+fi
+
+# 清理
+kill $SERVER_PID 2>/dev/null || true
+wait $SERVER_PID 2>/dev/null || true
+```
+
+#### success_criteria
+
+- 未修复时：执行 verify_cmds 脚本，kill -0 检查失败，输出 "RED: 服务进程已崩溃"；go run -race 输出包含 WARNING: DATA RACE 报告；日志中出现 fatal error: concurrent map read and map write 或 panic: runtime error: index out of range；go vet ./... 无警告（缺陷为运行时并发问题，不影响静态检查）。
+
+- 修复后：执行 verify_cmds 脚本，kill -0 检查通过，输出 "GREEN: 服务进程存活"；go run -race 无 WARNING: DATA RACE 输出；所有 HTTP 端点响应正常，POST /event 返回 200 状态码和 event_id，POST /pull 返回 200 状态码和事件列表；go vet ./... 无警告。
+
+## 缺陷详情
+
+| 字段 | 内容 |
+|------|------|
+| bug_id | event-conc-001 |
+| bug_category | concurrency |
+| 缺陷植入信息 | 在 Publish 方法中，会向 s.topicIndex[topic] 追加事件 ID，并修改 s.events 切片（存储事件对象）。在 Pull 方法中，会遍历 s.topicIndex 获取订阅匹配的主题列表，并读取 s.events 切片获取事件详情。两处均未使用 sync.RWMutex 保护。代码所在文件为 internal/event/store.go，函数名为 func (s *Store) Publish(topic string, payload interface{}, retention int) (string, error) 和 func (s *Store) Pull(subscriptionID string, limit int) ([]Event, bool, error)。 |
+| gold_root_cause | 文件：internal/event/store.go，符号：Store.Publish 与 Store.Pull，失效机制：两个方法并发访问共享的 map[string][]string（主题到事件ID列表）和 []*event（事件存储）。写入操作在 Publish 中修改 map 和切片，读取操作在 Pull 中遍历 map 和索引切片，未加锁导致数据竞争。Go 运行时可能抛出 concurrent map read and map write 或切片索引越界，导致进程崩溃。 |
+| Bugfix 题面（user_query） | 我们部署了事件分发服务，用于在不同微服务之间广播业务事件。在压测中，我们同时用 30 个客户端发布不同主题的事件（每秒 100 个），同时有 10 个订阅者持续拉取事件（每秒 20 次）。服务运行几十秒后会崩溃，日志显示 fatal error: concurrent map read and map write 或 panic: runtime error: index out of range。如果只发布或只拉取，服务稳定。请修复此并发问题，确保服务在高并发场景下稳定运行。 |
+| Diagnosis 题面（user_query 诊断变体） | 我们的事件分发服务在并发发布和拉取时崩溃，报错 concurrent map read and map write。我观察到只有在既有大量发布又有大量拉取时才会触发。先别改代码，帮我定位根本原因：为什么这两个操作会产生冲突？具体是哪个文件、哪个函数中的哪些代码导致了并发安全问题？ |
+| repo + setup | repo：./event-dispatcher（项目根目录）<br>base_commit：aba42855b3d5edee1a7b67538b2645ba04274acd<br>setup：cd event-dispatcher && export GOTOOLCHAIN=local |
+
+### verify_cmds
+
+```bash
+#!/bin/bash
+set -e
+
+# 环境准备（替换为实际仓库路径）
+REPO_URL="file:///path/to/event-dispatcher"
+BASE_COMMIT="aba42855b3d5edee1a7b67538b2645ba04274acd"
+git clone "$REPO_URL" event-dispatcher
+cd event-dispatcher
+git checkout "$BASE_COMMIT"
+export GOTOOLCHAIN=local
+
+# 启动服务（使用 -race 增强检测）
+go run -race ./cmd/server/main.go &
+SERVER_PID=$!
+sleep 2  # 等待服务就绪
+
+# 前置准备：创建一个订阅
+curl -X POST http://localhost:8080/subscribe \
+     -d '{"subscriber_id":"test-sub","topic_pattern":"order.*"}' \
+     -H "Content-Type: application/json" > /dev/null
+
+# 触发缺陷：并发发布和拉取
+# 启动 20 个发布协程（发布 order.created 和 order.updated）
+for i in {1..20}; do
+    (
+        while true; do
+            topic="order.$((RANDOM % 2 == 0 ? 'created' : 'updated'))"
+            curl -s -X POST http://localhost:8080/event \
+                 -d "{\"topic\":\"$topic\",\"payload\":{\"id\":$RANDOM}}" \
+                 -H "Content-Type: application/json" > /dev/null
+            sleep 0.1
+        done
+    ) &
+done
+
+# 启动 10 个拉取协程
+for i in {1..10}; do
+    (
+        while true; do
+            curl -s -X POST http://localhost:8080/pull \
+                 -d '{"subscription_id":"sub-001","limit":5}' \
+                 -H "Content-Type: application/json" > /dev/null
+            sleep 0.2
+        done
+    ) &
+done
+
+# 持续运行 5 秒，触发 panic
+sleep 5
+
+# 验证：检查进程是否存活
+if kill -0 $SERVER_PID 2>/dev/null; then
+    echo "GREEN: 服务进程存活，未发生 panic（修复后预期）"
+else
+    echo "RED: 服务进程已崩溃，触发并发 map/slice panic（未修复预期）"
+fi
+
+# 清理
+kill $SERVER_PID 2>/dev/null || true
+wait $SERVER_PID 2>/dev/null || true
+```
